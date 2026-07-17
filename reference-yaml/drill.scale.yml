@@ -1,0 +1,288 @@
+# ops/drill/drill.scale.yml
+# Scale ALL application services DOWN or UP — GitOps + Live Cluster
+#
+# Called by: templates/cd/deploy.drill.yml
+# Trigger:   DRILL_TIER variable set at pipeline run time
+#
+# Flow per job:
+#   STEP 1 — GitOps: clone repo → patch values.yaml → git push → ArgoCD syncs
+#   STEP 2 — Live:   oc login to cluster → oc scale deployments directly
+#
+# NS_MAP is declared ONCE per tier in .prod_ns_map / .preprod_ns_map
+# and inherited by all jobs via extends: — no duplication across jobs.
+#
+# Nonprod is handled in a separate file — no nonprod config here.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NAMESPACE MAP DEFINITIONS — declared once, inherited via extends:
+# ─────────────────────────────────────────────────────────────────────────────
+
+.prod_ns_map:
+  variables:
+    NS_MAP: |
+      declare -A NS_DEPLOYMENTS
+      NS_DEPLOYMENTS["${TARGET_ENV}-admin"]="admin-adminservice"
+      NS_DEPLOYMENTS["${TARGET_ENV}-frontend"]="merchantfe-merchant-frontend transactionfe-transaction-frontend"
+      NS_DEPLOYMENTS["${TARGET_ENV}-kms"]="kms-kmsservice"
+      NS_DEPLOYMENTS["${TARGET_ENV}-rns"]="ops-operationsservice refund-refundservice"
+      NS_DEPLOYMENTS["${TARGET_ENV}-merchant"]="merchant-merchantservice report-reportservice"
+      NS_DEPLOYMENTS["${TARGET_ENV}-simulators"]="demo-merchantsimulator javasimulator-javautilityapisimulator orderhash"
+      NS_DEPLOYMENTS["${TARGET_ENV}-transaction"]="payment-paymentservice txn-transactionservice"
+      # NS_DEPLOYMENTS["${TARGET_ENV}-notification"]="notify-notificationservice"
+
+.preprod_ns_map:
+  variables:
+    NS_MAP: |
+      declare -A NS_DEPLOYMENTS
+      NS_DEPLOYMENTS["${TARGET_ENV}-admin"]="admin-adminservice"
+      # NS_DEPLOYMENTS["${TARGET_ENV}-frontend"]="merchantfe-merchant-frontend transactionfe-transaction-frontend"
+      # NS_DEPLOYMENTS["${TARGET_ENV}-kms"]="kms-kmsservice"
+      # NS_DEPLOYMENTS["${TARGET_ENV}-rns"]="ops-operationsservice refund-refundservice"
+      # NS_DEPLOYMENTS["${TARGET_ENV}-merchant"]="merchant-merchantservice report-reportservice"
+      # NS_DEPLOYMENTS["${TARGET_ENV}-simulators"]="demo-merchantsimulator javasimulator-javautilityapisimulator orderhash"
+      # NS_DEPLOYMENTS["${TARGET_ENV}-transaction"]="payment-paymentservice txn-transactionservice"
+      # # NS_DEPLOYMENTS["${TARGET_ENV}-notification"]="notify-notificationservice"
+
+# .preprod_dc_ns_map:
+#   variables:
+#     NS_MAP: |
+#       declare -A NS_DEPLOYMENTS
+#       NS_DEPLOYMENTS["${TARGET_ENV}-admin"]="admin-adminservice"
+#       NS_DEPLOYMENTS["${TARGET_ENV}-frontend"]="merchantfe-merchant-frontend transactionfe-transaction-frontend"
+#       NS_DEPLOYMENTS["${TARGET_ENV}-kms"]="kms-kmsservice"
+#       NS_DEPLOYMENTS["${TARGET_ENV}-rns"]="ops-operationsservice refund-refundservice"
+#       NS_DEPLOYMENTS["${TARGET_ENV}-merchant"]="merchant-merchantservice report-reportservice"
+#       NS_DEPLOYMENTS["${TARGET_ENV}-simulators"]="demo-merchantsimulaterfe javasimulator-javautilityapisimulator orderhash"
+#       NS_DEPLOYMENTS["${TARGET_ENV}-transaction"]="payment-paymentservice txn-transactionservice"
+#       # NS_DEPLOYMENTS["${TARGET_ENV}-notification"]="notify-notificationservice"
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED SCRIPT — GitOps push → live oc scale (single anchor for all jobs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+.scale_with_live_cluster_script: &scale_with_live_cluster_script
+  - |
+    set -eo pipefail
+
+    # ── STEP 1: GitOps push ──────────────────────────────────────────────────
+    echo "==================================================================================="
+    echo " STEP 1: GITOPS PUSH"
+    echo " ENV: ${TARGET_ENV}"
+    echo "==================================================================================="
+
+    git clone "${DEPLOYMENT_REPO_URL}" deployment
+    cd deployment
+    git checkout "$DEPLOYMENT_BRANCH"
+
+    IFS=',' read -ra SERVICES <<< "$CHARTS"
+    CHANGED=false
+
+    for SERVICE in "${SERVICES[@]}"; do
+      FILE="${TARGET_ENV}/charts/${SERVICE}/values.yaml"
+      echo "Processing: $FILE"
+      [ -f "$FILE" ] || { echo "WARNING: $FILE not found — skipping"; continue; }
+
+      sed -i -E \
+        "s/^([[:space:]]*)replicaCount:[[:space:]]*[0-9]+/\1replicaCount: ${REPLICA_COUNT}/" \
+        "$FILE"
+      sed -i -E \
+        "/^[[:space:]]*autoscaling:/,/^[^[:space:]]/ \
+         s/^([[:space:]]*)enabled:[[:space:]]*(true|false)/\1enabled: ${AUTOSCALING_ENABLED}/" \
+        "$FILE"
+
+      if ! git diff --quiet "$FILE"; then
+        git add "$FILE"
+        CHANGED=true
+      fi
+    done
+
+    if [ "$CHANGED" = true ]; then
+      git commit \
+        -m "drill(${TARGET_ENV}): replicas=${REPLICA_COUNT} autoscaling=${AUTOSCALING_ENABLED} [ci skip]"
+
+      for i in 1 2 3; do
+        git push origin "$DEPLOYMENT_BRANCH" && break
+        echo "Push failed — retrying ($i/3)"
+        sleep 2
+        git pull --rebase origin "$DEPLOYMENT_BRANCH"
+      done
+      echo "✅ GitOps push done: ${TARGET_ENV} replicas=${REPLICA_COUNT} autoscaling=${AUTOSCALING_ENABLED}"
+    else
+      echo "No GitOps changes — already at target state, proceeding to live scale"
+    fi
+
+    # ── STEP 2: Scale live cluster ───────────────────────────────────────────
+    echo "==================================================================================="
+    echo "          STEP 2: SCALE LIVE CLUSTER"
+    echo "          CLUSTER: ${OC_API_URL}"
+    echo "          ENV:     ${TARGET_ENV}"
+    echo "==================================================================================="
+
+    oc login "${OC_API_URL}" \
+      --token="${OC_TOKEN}" \
+      --insecure-skip-tls-verify
+
+    eval "$NS_MAP"
+
+    for namespace in "${!NS_DEPLOYMENTS[@]}"; do
+      for deploy in ${NS_DEPLOYMENTS[$namespace]}; do
+        echo "Scaling ${deploy} in ${namespace} to ${REPLICA_COUNT}"
+        oc scale deployment/${deploy} -n "${namespace}" --replicas=${REPLICA_COUNT}
+      done
+    done
+
+    echo "==================================================================================="
+    echo "          SCALE OPERATION COMPLETED"
+    echo "          ENV: ${TARGET_ENV} → replicas=${REPLICA_COUNT}"
+    echo "==================================================================================="
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROD
+# ─────────────────────────────────────────────────────────────────────────────
+
+Prod_DC_Scale_All_Down:
+  extends:
+    - .drill_git_setup
+    - .prod_ns_map
+  stage: DC_Application_Services
+  when: manual
+  variables:
+    GIT_STRATEGY:        none
+    TARGET_ENV:          "prod-dc"
+    REPLICA_COUNT:       "0"
+    AUTOSCALING_ENABLED: "false"
+    CHARTS:              "$ALL_CHARTS"
+    OC_API_URL:          "https://api.dc.prod.epay.sbi:6443"    # ← confirm URL
+    OC_TOKEN:            "$OCP_TOKEN_PROD_DC"
+  rules:
+    - if: '$DRILL_TIER == "prod"'
+  script: *scale_with_live_cluster_script
+
+Prod_DC_Scale_All_Up:
+  extends:
+    - .drill_git_setup
+    - .prod_ns_map
+  stage: DC_Application_Services
+  when: manual
+  variables:
+    GIT_STRATEGY:        none
+    TARGET_ENV:          "prod-dc"
+    REPLICA_COUNT:       "1"
+    AUTOSCALING_ENABLED: "true"
+    CHARTS:              "$ALL_CHARTS"
+    OC_API_URL:          "https://api.dc.prod.epay.sbi:6443"    # ← confirm URL
+    OC_TOKEN:            "$OCP_TOKEN_PROD_DC"
+  rules:
+    - if: '$DRILL_TIER == "prod"'
+  script: *scale_with_live_cluster_script
+
+Prod_DR_Scale_All_Down:
+  extends:
+    - .drill_git_setup
+    - .prod_ns_map
+  stage: DR_Application_Services
+  when: manual
+  variables:
+    GIT_STRATEGY:        none
+    TARGET_ENV:          "prod-dr"
+    REPLICA_COUNT:       "0"
+    AUTOSCALING_ENABLED: "false"
+    CHARTS:              "$ALL_CHARTS"
+    OC_API_URL:          "https://api.dr.prod.epay.sbi:6443"
+    OC_TOKEN:            "$OCP_TOKEN_PROD_DR"
+  rules:
+    - if: '$DRILL_TIER == "prod"'
+  script: *scale_with_live_cluster_script
+
+Prod_DR_Scale_All_Up:
+  extends:
+    - .drill_git_setup
+    - .prod_ns_map
+  stage: DR_Application_Services
+  when: manual
+  variables:
+    GIT_STRATEGY:        none
+    TARGET_ENV:          "prod-dr"
+    REPLICA_COUNT:       "1"
+    AUTOSCALING_ENABLED: "true"
+    CHARTS:              "$ALL_CHARTS"
+    OC_API_URL:          "https://api.dr.prod.epay.sbi:6443"
+    OC_TOKEN:            "$OCP_TOKEN_PROD_DR"
+  rules:
+    - if: '$DRILL_TIER == "prod"'
+  script: *scale_with_live_cluster_script
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PREPROD
+# ─────────────────────────────────────────────────────────────────────────────
+
+PreProd_DC_Scale_All_Down:
+  extends:
+    - .drill_git_setup
+    - .preprod_ns_map
+  stage: DC_Application_Services
+  when: manual
+  variables:
+    GIT_STRATEGY:        none
+    TARGET_ENV:          "pre-prod-dc"
+    REPLICA_COUNT:       "0"
+    AUTOSCALING_ENABLED: "false"
+    CHARTS:              "$ALL_CHARTS"
+    OC_API_URL:          "https://api.dcpreprod.epay.sbi:6443" # ← confirm URL
+    OC_TOKEN:            "$OCP_TOKEN_PREPROD_DC"
+  rules:
+    - if: '$DRILL_TIER == "preprod"'
+  script: *scale_with_live_cluster_script
+
+PreProd_DC_Scale_All_Up:
+  extends:
+    - .drill_git_setup
+    - .preprod_ns_map
+  stage: DC_Application_Services
+  when: manual
+  variables:
+    GIT_STRATEGY:        none
+    TARGET_ENV:          "pre-prod-dc"
+    REPLICA_COUNT:       "1"
+    AUTOSCALING_ENABLED: "true"
+    CHARTS:              "$ALL_CHARTS"
+    OC_API_URL:          "https://api.dcpreprod.epay.sbi:6443" # ← confirm URL
+    OC_TOKEN:            "$OCP_TOKEN_PREPROD_DC"
+  rules:
+    - if: '$DRILL_TIER == "preprod"'
+  script: *scale_with_live_cluster_script
+
+PreProd_DR_Scale_All_Down:
+  extends:
+    - .drill_git_setup
+    - .preprod_ns_map
+  stage: DR_Application_Services
+  when: manual
+  variables:
+    GIT_STRATEGY:        none
+    TARGET_ENV:          "pre-prod"
+    REPLICA_COUNT:       "0"
+    AUTOSCALING_ENABLED: "false"
+    CHARTS:              "$ALL_CHARTS"
+    OC_API_URL:          "https://api.preprod.epay.sbi:6443" # ← confirm URL
+    OC_TOKEN:            "$OCP_TOKEN_PREPROD_DR"
+  rules:
+    - if: '$DRILL_TIER == "preprod"'
+  script: *scale_with_live_cluster_script
+
+PreProd_DR_Scale_All_Up:
+  extends:
+    - .drill_git_setup
+    - .preprod_ns_map
+  stage: DR_Application_Services
+  when: manual
+  variables:
+    GIT_STRATEGY:        none
+    TARGET_ENV:          "pre-prod"
+    REPLICA_COUNT:       "1"
+    AUTOSCALING_ENABLED: "true"
+    CHARTS:              "$ALL_CHARTS"
+    OC_API_URL:          "https://api.preprod.epay.sbi:6443" # ← confirm URL
+    OC_TOKEN:            "$OCP_TOKEN_PREPROD_DR"
+  rules:
+    - if: '$DRILL_TIER == "preprod"'
+  script: *scale_with_live_cluster_script

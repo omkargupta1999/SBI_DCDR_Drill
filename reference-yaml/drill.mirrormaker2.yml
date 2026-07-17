@@ -1,0 +1,157 @@
+# ops/drill/drill.mirrormaker2.yml
+# Kafka MirrorMaker2 toggle — GitOps approach
+# Clones deployment repo → updates epay_common/values.yaml → git push → ArgoCD syncs
+#
+# Called by: templates/cd/deploy.drill.yml
+# Trigger:   DRILL_TIER variable set at pipeline run time
+#
+# mirrorMaker2.enabled=true:  replication ACTIVE (source → destination)
+# mirrorMaker2.enabled=false: replication STOPPED
+#
+# Nonprod: no MirrorMaker2 — jobs not shown for nonprod tier
+
+# ── Shared script — awk for precise mirrorMaker2 block update ─────────────────
+.mirrormaker2_script: &mirrormaker2_script
+  - |
+    set -eo pipefail
+
+    git clone "$DEPLOYMENT_REPO_URL" deployment
+    cd deployment
+    git checkout "$DEPLOYMENT_BRANCH"
+
+    VALUES_FILE="${TARGET_ENV}/charts/epay_common/values.yaml"
+    echo "Processing: $VALUES_FILE"
+    [ -f "$VALUES_FILE" ] || { echo "ERROR: $VALUES_FILE not found"; exit 1; }
+
+    # awk: updates ONLY mirrorMaker2.enabled — does not touch other enabled fields
+    awk -v val="$MIRRORMAKER2_ENABLED" '
+      BEGIN { in_mm2=0 }
+      /^[[:space:]]*mirrorMaker2:[[:space:]]*$/ { in_mm2=1; print; next }
+      in_mm2 && /^[[:space:]]*enabled:/ {
+        match($0, /^([[:space:]]*)/, arr)
+        print arr[1] "enabled: " val
+        next
+      }
+      in_mm2 && /^[[:space:]]*[a-zA-Z0-9_-]+:/ { in_mm2=0 }
+      { print }
+    ' "$VALUES_FILE" > "${VALUES_FILE}.tmp"
+    mv "${VALUES_FILE}.tmp" "$VALUES_FILE"
+
+    if git diff --quiet "$VALUES_FILE"; then
+      echo "No change — mirrorMaker2.enabled already ${MIRRORMAKER2_ENABLED}"
+      exit 0
+    fi
+
+    git add "$VALUES_FILE"
+    git commit \
+      -m "drill(${TARGET_ENV}): mirrorMaker2.enabled=${MIRRORMAKER2_ENABLED}"
+
+    for i in 1 2 3; do
+      git push origin "$DEPLOYMENT_BRANCH" && break
+      echo "Push failed — retrying ($i/3)"
+      sleep 2
+      git pull --rebase origin "$DEPLOYMENT_BRANCH"
+    done
+    echo "✅ MirrorMaker2 ${MIRRORMAKER2_ENABLED} for ${TARGET_ENV}"
+
+# ── Prod DC ───────────────────────────────────────────────────────────────────
+Prod_DC_MirrorMaker2_Down:
+  extends: .drill_git_setup
+  stage: MirrorMaker2
+  when: manual
+  variables:
+    GIT_STRATEGY:       none
+    TARGET_ENV:         "prod-dc"
+    MIRRORMAKER2_ENABLED: "false"
+  rules:
+    - if: '$DRILL_TIER == "prod"'
+  script: *mirrormaker2_script
+
+Prod_DC_MirrorMaker2_Up:
+  extends: .drill_git_setup
+  stage: MirrorMaker2
+  when: manual
+  variables:
+    GIT_STRATEGY:       none
+    TARGET_ENV:         "prod-dc"
+    MIRRORMAKER2_ENABLED: "true"
+  rules:
+    - if: '$DRILL_TIER == "prod"'
+  script: *mirrormaker2_script
+
+# ── Prod DR ───────────────────────────────────────────────────────────────────
+Prod_DR_MirrorMaker2_Down:
+  extends: .drill_git_setup
+  stage: MirrorMaker2
+  when: manual
+  variables:
+    GIT_STRATEGY:       none
+    TARGET_ENV:         "prod-dr"
+    MIRRORMAKER2_ENABLED: "false"
+  rules:
+    - if: '$DRILL_TIER == "prod"'
+  script: *mirrormaker2_script
+
+Prod_DR_MirrorMaker2_Up:
+  extends: .drill_git_setup
+  stage: MirrorMaker2
+  when: manual
+  variables:
+    GIT_STRATEGY:       none
+    TARGET_ENV:         "prod-dr"
+    MIRRORMAKER2_ENABLED: "true"
+  rules:
+    - if: '$DRILL_TIER == "prod"'
+  script: *mirrormaker2_script
+
+# ── Preprod DC ────────────────────────────────────────────────────────────────
+PreProd_DC_MirrorMaker2_Down:
+  extends: .drill_git_setup
+  stage: MirrorMaker2
+  when: manual
+  variables:
+    GIT_STRATEGY:       none
+    TARGET_ENV:         "pre-prod-dc"
+    MIRRORMAKER2_ENABLED: "false"
+  rules:
+    - if: '$DRILL_TIER == "preprod"'
+  script: *mirrormaker2_script
+
+PreProd_DC_MirrorMaker2_Up:
+  extends: .drill_git_setup
+  stage: MirrorMaker2
+  when: manual
+  variables:
+    GIT_STRATEGY:       none
+    TARGET_ENV:         "pre-prod-dc"
+    MIRRORMAKER2_ENABLED: "true"
+  rules:
+    - if: '$DRILL_TIER == "preprod"'
+  script: *mirrormaker2_script
+
+# ── Preprod DR ────────────────────────────────────────────────────────────────
+PreProd_DR_MirrorMaker2_Down:
+  extends: .drill_git_setup
+  stage: MirrorMaker2
+  when: manual
+  variables:
+    GIT_STRATEGY:       none
+    TARGET_ENV:         "pre-prod"
+    MIRRORMAKER2_ENABLED: "false"
+  rules:
+    - if: '$DRILL_TIER == "preprod"'
+  script: *mirrormaker2_script
+
+PreProd_DR_MirrorMaker2_Up:
+  extends: .drill_git_setup
+  stage: MirrorMaker2
+  when: manual
+  variables:
+    GIT_STRATEGY:       none
+    TARGET_ENV:         "pre-prod"
+    MIRRORMAKER2_ENABLED: "true"
+  rules:
+    - if: '$DRILL_TIER == "preprod"'
+  script: *mirrormaker2_script
+
+# Nonprod: no MirrorMaker2 — stage intentionally empty for nonprod tier

@@ -1,0 +1,60 @@
+# templates/cd/deploy.drill.yml
+# DC/DR Drill orchestrator — switchover and switchback
+#
+# Included by deployment repo .gitlab-ci.yml when DRILL_TIER variable is set.
+# Owns all stages, variables, and includes. Deployment repo defines nothing.
+#
+# ── How to trigger ────────────────────────────────────────────────────────────
+# GitLab → deployment repo → CI/CD → Pipelines → Run pipeline
+#   Branch:   main
+#   Variable: DRILL_TIER = prod | preprod | nonprod
+#
+# ── Stages ────────────────────────────────────────────────────────────────────
+# Stage order matches operational drill sequence:
+#   Step 1: Maintenance_Page          — enable maintenance before scaling
+#   Step 2: DC_Application_Services   — scale DC (down for switchover, up for switchback)
+#   Step 3: DR_Application_Services   — scale DR (up for switchover, down for switchback)
+#   Step 4: MirrorMaker2              — toggle Kafka replication direction
+#
+# DC and DR are separate stages so operator confirms DC is done before touching DR.
+#
+# ── Tier → environments ───────────────────────────────────────────────────────
+#   DRILL_TIER=prod:
+#     Maintenance_Page:        prod-dc + prod-dr
+#     DC_Application_Services: prod-dc
+#     DR_Application_Services: prod-dr
+#     MirrorMaker2:            prod-dc + prod-dr
+#
+#   DRILL_TIER=preprod:
+#     Maintenance_Page:        pre-prod-dc + pre-prod
+#     DC_Application_Services: pre-prod-dc
+#     DR_Application_Services: pre-prod
+#     MirrorMaker2:            pre-prod-dc + pre-prod
+#
+#   DRILL_TIER=nonprod:
+#     DC_Application_Services: dev (scale test only — no maintenance, no MM2)
+#
+# ── Audit trail ───────────────────────────────────────────────────────────────
+#   GitLab pipeline: who triggered, when, DRILL_TIER value
+#   Git commits: drill(prod-dc): replicas=0 autoscaling=false [ci skip]
+
+stages:
+  - Maintenance_Page
+  - DC_Application_Services
+  - DR_Application_Services
+  - MirrorMaker2
+
+variables:
+  GIT_STRATEGY:        none
+  DEPLOYMENT_BRANCH:   "main"
+  DEPLOYMENT_REPO_URL: "https://oauth2:$GITLAB_CI_DEPLOY_TOKEN@gitlab.sbi/itepaypg-sbiepay2/infra/devops/deployment.git"
+  MAINTENANCE_CHART:   "epay_maintenance_fe"
+
+  # All application service charts — updated during scale operations
+  ALL_CHARTS: >-
+    epay_admin_service,epay_key_managment,epay_merchant_fe,epay_merchant_service,epay_merchant_simulator,epay_notification_service,epay_operations_service,epay_order_hash,epay_payment_service,epay_refund_service,epay_reports_service,epay_transaction_fe,epay_transaction_service,java-utility-api-simulator
+
+include:
+  - local: 'ops/drill/drill.maintenance.yml'
+  - local: 'ops/drill/drill.scale.yml'
+  - local: 'ops/drill/drill.mirrormaker2.yml'
